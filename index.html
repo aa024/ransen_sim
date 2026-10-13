@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>乱戦シミュレータ</title>
+<style>
+:root { --bg:#f4f2ee; --panel:#fff; --text:#1d1d1f; --muted:#6b6b70; --line:#dcd8d0; --ally:#2f6fd6; --enemy:#d23c3c; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#17171a; --panel:#222226; --text:#ececf0; --muted:#a0a0a8; --line:#3a3a40; --ally:#6aa0ff; --enemy:#ff7070; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--text); font-family:system-ui,"Segoe UI","Yu Gothic UI",sans-serif; }
+main { max-width:860px; margin:0 auto; padding:16px; }
+h1 { font-size:1.3rem; margin:4px 0 12px; }
+.panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin-bottom:12px; }
+.timer { display:flex; gap:28px; flex-wrap:wrap; }
+.timer b { display:inline-block; min-width:5.5ch; text-align:right; font-size:2rem; font-family:Consolas,"Cascadia Mono",ui-monospace,monospace; }
+.timer small { display:block; color:var(--muted); }
+.ctl { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+button, select, input { font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:6px; }
+button { padding:6px 14px; cursor:pointer; } button:disabled { opacity:.4; cursor:default; }
+input[type=number] { width:4.2em; padding:2px 4px; }
+#status { margin-top:8px; min-height:1.3em; font-weight:600; }
+.sides { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+@media (max-width:640px) { .sides { grid-template-columns:1fr; } }
+h2 { font-size:1rem; margin:0 0 8px; display:flex; justify-content:space-between; }
+.ally h2 { color:var(--ally); } .enemy h2 { color:var(--enemy); }
+.unit { border-top:1px solid var(--line); padding:8px 0; }
+.unit.dead { opacity:.45; }
+.unit label { white-space:nowrap; margin-right:10px; font-size:.9rem; }
+.bar { height:12px; background:var(--line); border-radius:6px; overflow:hidden; margin-top:6px; }
+.bar div { height:100%; }
+.ally .bar div { background:var(--ally); } .enemy .bar div { background:var(--enemy); }
+.bar { display:flex; }
+.bar .red { background:#e8a33a !important; }
+.hp { text-align:right; margin-top:4px; font-weight:700; font-variant-numeric:tabular-nums; }
+.note { font-size:.8rem; color:var(--muted); line-height:1.6; }
+</style>
+</head>
+<body>
+<main>
+  <h1>英傑大戦 乱戦シミュレータ</h1>
+  <div class="panel">
+    <div class="timer">
+      <div><small>カウント</small><b id="tC">0.00</b></div>
+      <div><small>秒</small><b id="tS">0.0</b></div>
+    </div>
+    <div class="ctl">
+      <button id="play">▶ 開始</button>
+      <button id="skip">⏭ 撃破までスキップ</button>
+      <button id="reset">↺ リセット</button>
+    </div>
+    <div id="status"></div>
+  </div>
+
+  <div class="sides">
+    <div class="panel ally"><h2>自軍 <label>部隊数 <select id="nA"></select></label></h2><div id="A"></div></div>
+    <div class="panel enemy"><h2>敵軍 <label>部隊数 <select id="nE"></select></label></h2><div id="E"></div></div>
+  </div>
+
+  <p class="note">
+    乱戦ダメージ：5.2 + (自武力 − 敵武力) × 0.8（兵力%）を1.5秒ごと。1カウント＝2.4秒。<br>
+    前提：自軍・敵軍の全部隊が互いに乱戦。複数の相手とはそれぞれダメージをやり取りし、同時に適用。初回は開始1.5秒後。ダメージの下限は1。<br>
+    気合：受けたダメージの15%が赤ゲージ（橙）になり、2秒ごとに赤ゲージから兵力1.5%回復（回復タイミングは赤ゲージが0から溜まった時点から2秒ごと。同時刻はダメージ→回復の順）。100%を超える部分は赤ゲージにならず、100%を超えては回復しない。兵力0で撤退。
+  </p>
+</main>
+
+<script>
+const STEP = 0.5, COUNT = 2.4, EPS = 1e-9;  // 0.5秒刻みで進める（乱戦=3刻み、気合回復=4刻み）
+const $ = id => document.getElementById(id);
+const units = { A: [], E: [] };   // { bu, hp0, hp, kiai, red, next(次の回復の刻み。0=なし) }
+let tick = 0, running = false, acc = 0, last = 0;
+
+const dmg = (my, op) => Math.max(1, 5.2 + (my - op) * 0.8);
+const live = s => units[s].filter(u => u.hp > EPS);
+
+function build(s) {
+  const n = +$('n' + s).value;
+  while (units[s].length < n) units[s].push({ bu: 6, hp0: 100, hp: 100, kiai: false, red: 0, next: 0 });
+  units[s].length = n;
+  $(s).innerHTML = units[s].map((u, i) => `
+    <div class="unit" id="${s}${i}">
+      <label>武力 <input type="number" min="0" max="99" value="${u.bu}" data-k="bu"></label>
+      <label>兵力 <input type="number" min="1" max="200" value="${u.hp0}" data-k="hp0">%</label>
+      <label><input type="checkbox" ${u.kiai ? 'checked' : ''} data-k="kiai"> 気合</label>
+      <div class="hp" id="${s}${i}h"></div>
+      <div class="bar"><div id="${s}${i}b"></div><div class="red" id="${s}${i}r"></div></div>
+    </div>`).join('');
+  units[s].forEach((u, i) => $(s + i).querySelectorAll('input').forEach(inp => inp.oninput = () => {
+    if (inp.dataset.k === 'kiai') { u.kiai = inp.checked; if (!u.kiai) u.red = u.next = 0; return render(); }
+    const hi = inp.dataset.k === 'bu' ? 99 : 200, lo = inp.dataset.k === 'bu' ? 0 : 1;
+    const v = Math.min(hi, Math.max(lo, Math.round(+inp.value) || 0));
+    u[inp.dataset.k] = v;
+    if (inp.dataset.k === 'hp0') { u.hp = v; u.red = u.next = 0; }   // 兵力を変えたら現在兵力も上書き
+    render();
+  }));
+}
+
+function reset() {
+  running = false; tick = 0; acc = 0;
+  for (const s of ['A', 'E']) units[s].forEach(u => { u.hp = u.hp0; u.red = u.next = 0; });
+  $('status').textContent = '';
+  render();
+}
+
+// 0.5秒分の処理。撃破が出たら true
+function step() {
+  tick++;
+  const killed = [];
+  if (tick % 3 === 0) {          // 乱戦ダメージ（1.5秒ごと）
+    const a = live('A'), e = live('E');
+    const dA = a.map(u => e.reduce((t, v) => t + dmg(v.bu, u.bu), 0));
+    const dE = e.map(u => a.reduce((t, v) => t + dmg(v.bu, u.bu), 0));
+    const hit = (u, d) => {
+      if (d <= 0) return;
+      const before = u.hp;
+      u.hp = Math.max(0, u.hp - d);
+      const lost = Math.max(0, Math.min(before, 100) - u.hp);   // 100%を超える部分の減少は気合の対象外
+      if (!u.kiai || lost <= 0) return;
+      if (u.red <= EPS) u.next = tick + 4;   // 赤ゲージが0から溜まった時点から2秒を数える
+      u.red += lost * 0.15;
+    };
+    a.forEach((u, i) => hit(u, dA[i]));
+    e.forEach((u, i) => hit(u, dE[i]));
+    a.forEach(u => u.hp <= EPS && (u.hp = 0, u.red = u.next = 0, killed.push('自軍' + (units.A.indexOf(u) + 1))));
+    e.forEach(u => u.hp <= EPS && (u.hp = 0, u.red = u.next = 0, killed.push('敵軍' + (units.E.indexOf(u) + 1))));
+  }
+  // 気合回復（赤ゲージが溜まってから2秒ごとに1.5%）
+  for (const s of ['A', 'E']) live(s).forEach(u => {
+    if (!u.next || u.next !== tick) return;
+    const h = Math.max(0, Math.min(1.5, u.red, 100 - u.hp));   // 100%を超えては回復しない
+    u.hp += h; u.red -= h;
+    if (u.red < EPS) u.red = u.next = 0;
+    else u.next = tick + 4;
+  });
+  if (killed.length) {
+    const t = tick * STEP;
+    $('status').textContent = `${killed.join('・')} 撃破（${(t / COUNT).toFixed(2)}カウント / ${t.toFixed(1)}秒）`;
+    running = false; acc = 0;
+  }
+  return killed.length > 0;
+}
+
+const over = () => !live('A').length || !live('E').length;
+
+function frame(ts) {
+  if (!running) return;
+  acc += Math.min(0.25, (ts - last) / 1000); last = ts;
+  while (running && acc >= STEP) { acc -= STEP; step(); }
+  render();
+  if (running) requestAnimationFrame(frame);
+}
+
+function render() {
+  const t = tick * STEP + (running ? acc : 0);
+  $('tC').textContent = (t / COUNT).toFixed(2);
+  $('tS').textContent = t.toFixed(1);
+  for (const s of ['A', 'E']) units[s].forEach((u, i) => {
+    $(s + i).classList.toggle('dead', u.hp <= EPS);
+    $(s + i + 'h').textContent = (Math.round(u.hp * 10) / 10).toFixed(1) + '%';
+    $(s + i + 'b').style.width = Math.min(100, u.hp / 2) + '%';
+    $(s + i + 'r').style.width = Math.min(100, u.red / 2) + '%';
+    $(s + i + 'h').textContent += u.red > EPS ? `（赤 ${u.red.toFixed(1)}）` : '';
+  });
+  $('play').textContent = running ? '⏸ 一時停止' : tick ? '▶ 再開' : '▶ 開始';
+  $('play').disabled = $('skip').disabled = over();
+}
+
+$('play').onclick = () => {
+  if (running) { running = false; return render(); }
+  if (over()) return;
+  $('status').textContent = '';
+  running = true; last = performance.now();
+  requestAnimationFrame(frame); render();
+};
+$('skip').onclick = () => {
+  running = false; acc = 0;
+  $('status').textContent = '';
+  while (!over() && !step()) {}
+  render();
+};
+$('reset').onclick = reset;
+for (const s of ['A', 'E']) {
+  $('n' + s).innerHTML = [1, 2, 3, 4, 5, 6, 7, 8].map(n => `<option>${n}</option>`).join('');
+  $('n' + s).onchange = () => { build(s); reset(); };
+  build(s);
+}
+reset();
+</script>
+</body>
+</html>
